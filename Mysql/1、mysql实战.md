@@ -1,6 +1,8 @@
 资源： [极客时间mysql实战](https://time.geekbang.org/column/article/70215)
 
 # 基础
+DML:更改表内数据的（insert/update/delete/select
+DDL:更改表结构（alter/create/drop
 ## 1、基础架构
 mysql分为server层和存储引擎层 
 - Server 层 包括连接器、查询缓存、分析器、优化器、执行器等，涵盖 MySQL 的大多数核心服务功能，以及所有的内置函数（如日期、时间、数学和加密函数等），所有跨存储引擎的功能都在这一层实现，比如存储过程、触发器、视图等。
@@ -34,11 +36,16 @@ select语句
 ## 2、日志系统
 Redo log （重做日志）
 InnoDB引擎特有的日志。物理日志（在哪做了什么修改）
-WAL技术 （write-ahead logging) 先写日志再写磁盘 
+WAL技术 （write-ahead logging） 先写日志再写磁盘 
 InnoDB就是循环的粉板，write pos为当前记录位置，checkpoint为当前要擦除的位置。
 crash-safe 保障数据库异常重启后，提交的记录不会丢失
 
 binLog （归档日志）
+- 主库（Master）：业务写入数据库，所有增删改、建表改表操作都在主库执行；
+- 备库（Slave/Replica）：实时同步主库数据，作为备份、读写分离分担查询；
+
+ 主库专属日志文件，记录所有修改数据 / 表结构的 SQL：DML（insert/update/delete）、DDL（alter/drop/create/truncate）都会写入 binlog；备库靠 binlog 同步主库变更，是主从复制的数据源。
+主库所有变更记录到 binlog，备库拉取 binlog、重放 SQL，保证数据和主库一致。
 server层的日志。逻辑日志（语句具体逻辑
 
 两阶段提交 prepare commit
@@ -103,6 +110,15 @@ InnoDB的索引模型
 
 当 mysqldump 使用参数–single-transaction 的时候，导数据之前就会启动一个事务，来确保拿到一致性视图。——但只适用于支持事务引擎的库
 
+> mysqldump：逻辑备份命令行程序
+```
+# 备份单个库
+mysqldump -uroot -p --single-transaction test_db > test_back.sql
+
+# 只备份单张表
+mysqldump -uroot -p --single-transaction test_db t1 > t1_back.sql
+```
+
 ### 表级锁
 - 表锁
 语法是 lock tables … read/write，以用 unlock tables 主动释放锁，也可以在客户端断开的时候自动释放
@@ -117,4 +133,43 @@ InnoDB的索引模型
 
 死锁和死锁检测
 
+**--single-transaction**
+mysqldump 逻辑备份参数，基于 RR 隔离级别 + 一致性快照，不加全局读锁，靠事务快照读拿全库一致性数据：
+
 ## 7、减少行锁对性能影响
+*在 InnoDB 事务中，行锁是在需要的时候才加上的，但并不是不需要了就立刻释放，而是要等到事务结束时才释放。这个就是两阶段锁协议。*
+
+**死锁解决** 
+当出现死锁以后，有两种策略：
+- 一种策略是，直接进入等待，直到超时。这个超时时间可以通过参数 innodb_lock_wait_timeout 来设置。
+- 另一种策略是，发起**死锁检测**，发现死锁后，主动回滚死锁链条中的某一个事务，让其他事务得以继续执行。将参数 innodb_deadlock_detect 设置为 on，表示开启这个逻辑。
+
+*死锁检测消耗大量 cpu资源 会使热点行出现性能问题*
+解决：
+- 确保业务无死锁出现，可以提前关闭死锁自动检测
+- 控制并发度：客户端控制并发线程数量、或做在数据库服务端
+
+**备库复制分两个线程**：
+- IO 线程：拉取主库 binlog 文件，不受 MDL 锁影响，持续拉取、落地本地 relay log；
+- SQL 线程：读取 relay log、逐条重放 SQL，这里会被 MDL 锁卡住。
+所以如果备库过程中执行了语句开了mdl锁，会使binlog回放阻塞，主从复制延迟
+
+>备库过程中，主库执行一条ddl后：
+备库 mysqldump 备份会话执行 show create table t1 / select * from t1，持有 t1 的 MDL 读锁；
+主库产生一条针对 t1 的 DDL，通过 binlog 同步到备库 relay log；
+备库 SQL 线程取出这条 DDL，执行前需要申请 t1 的 MDL 写锁；
+MDL 读锁与写锁互斥，DDL 阻塞，状态 Waiting for table metadata lock；
+SQL 线程卡住不动，后面所有 binlog 事件全部堆积，复制延迟持续上涨。
+
+## 8、事务到底是隔离的还是不隔离的
+*可重复读隔离级别，事务 T 启动的时候会创建一个视图 read-view，之后事务 T 执行期间，即使有其他事务修改了数据，事务 T 看到的仍然跟在启动时看到的一样*
+>begin/start transaction 命令并不是一个事务的起点，在执行到它们之后的第一个操作 InnoDB 表的语句，事务才真正启动。如果你想要马上启动一个事务，可以使用 start transaction with consistent snapshot 这个命令。
+
+一致性读依赖mvcc快照，利用事务id递增特性，来做读取数据时历史版本的选择；当前读实际上是由行锁来实现的，持有行锁的更新操作才能进行当前读，否则更新操作会阻塞
+更新数据均需**先读后先**，即**当前读**
+
+- InnoDB 的行数据有多个版本，每个数据版本有自己的 row trx_id，每个事务或者语句有自己的一致性视图。普通查询语句是一致性读，一致性读会根据 row trx_id 和一致性视图确定数据版本的可见性。
+- 对于可重复读，查询只承认在事务启动前就已经提交完成的数据；
+    - 对于读提交，查询只承认在语句启动前就已经提交完成的数据；
+    - 当前读，总是读取已经提交完成的最新版本。
+
